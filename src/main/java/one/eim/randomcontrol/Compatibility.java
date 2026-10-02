@@ -1,12 +1,10 @@
 package one.eim.randomcontrol;
 
 import org.bukkit.Bukkit;
-import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
@@ -24,45 +22,56 @@ public final class Compatibility {
     private static final Object sharedRandom;
     private static final MethodHandle craftEntityGetHandle;
     private static final MethodHandle entityGetRandom;
-    private static final MethodHandle entitySetRandom;
+    private static final ObjectUnsafe randomFieldWriter;
 
     static {
         final MethodHandles.Lookup lookup = MethodHandles.lookup();
 
-        final @NotNull Class<?> entityClass = requireNonNullElseGet(
-                clazz("net.minecraft.world.entity.Entity"), // >1.17.1
-                () -> sneakyThrows(() -> Class.forName(Bukkit.getServer().getClass().getName() // <1.16
+        final Class<?> entityClass = requireNonNullElseGet(
+                clazz("net.minecraft.world.entity.Entity"),
+                () -> sneakyThrows(() -> Class.forName(Bukkit.getServer().getClass().getName()
                         .replace("org.bukkit.craftbukkit", "net.minecraft.server")
                         .replace("CraftServer", "Entity")))
         );
 
         final @Nullable Class<?> randomSourceClass = clazz("net.minecraft.util.RandomSource");
-
         hasRandomSource = randomSourceClass != null;
 
         createRandom = hasRandomSource
                 ? sneakyThrows(() -> lookup.unreflect(
                 Arrays.stream(randomSourceClass.getDeclaredMethods())
-                        .filter(m -> m.getReturnType() == randomSourceClass && m.getParameterCount() == 0 && Modifier.isStatic(m.getModifiers()) && Modifier.isPublic(m.getModifiers()))
+                        .filter(m -> m.getName().equals("create")
+                                && m.getReturnType() == randomSourceClass
+                                && m.getParameterCount() == 0
+                                && Modifier.isStatic(m.getModifiers())
+                                && Modifier.isPublic(m.getModifiers()))
                         .findFirst()
-                        .orElseThrow(() -> new ExceptionInInitializerError("Failed to locate RandomSource RandomSource.create() method"))
+                        .orElseThrow(() -> new ExceptionInInitializerError(
+                                "Failed to locate RandomSource.create() method"))
         ))
-                : sneakyThrows(() -> lookup.findConstructor(Random.class, MethodType.methodType(void.class)));
+                : sneakyThrows(() -> lookup.findConstructor(Random.class,
+                java.lang.invoke.MethodType.methodType(void.class)));
 
         randomSetSeed = hasRandomSource
                 ? sneakyThrows(() -> lookup.unreflect(
                 Arrays.stream(randomSourceClass.getDeclaredMethods())
-                        .filter(m -> m.getReturnType() == void.class && m.getParameterCount() == 1 && m.getParameterTypes()[0] == long.class && Modifier.isPublic(m.getModifiers()))
+                        .filter(m -> m.getName().equals("setSeed")
+                                && m.getReturnType() == void.class
+                                && m.getParameterCount() == 1
+                                && m.getParameterTypes()[0] == long.class
+                                && Modifier.isPublic(m.getModifiers()))
                         .findFirst()
-                        .orElseThrow(() -> new ExceptionInInitializerError("Failed to locate RandomSource#setSeed(long) method"))
+                        .orElseThrow(() -> new ExceptionInInitializerError(
+                                "Failed to locate RandomSource#setSeed(long) method"))
         ))
                 : sneakyThrows(() -> lookup.unreflect(Random.class.getMethod("setSeed", long.class)));
 
-        Field randomField;
+        final Field randomField;
         try {
             randomField = entityClass.getDeclaredField("random");
         } catch (NoSuchFieldException e) {
-            throw new ExceptionInInitializerError("Failed to find Random on Entity. No fields with type RandomSource/Random. Not Paper?");
+            throw new ExceptionInInitializerError(
+                    "Failed to find Entity.random. The server may not be Paper or its Entity implementation changed.");
         }
 
         randomField.setAccessible(true);
@@ -71,13 +80,24 @@ public final class Compatibility {
 
         final Class<?> craftEntityClass = Objects.requireNonNull(
                 clazz(Bukkit.getServer().getClass().getName().replace("CraftServer", "entity.CraftEntity")),
-                "Can not find o.b.c.v.entity.CraftEntity - not Paper?"
+                "Can not find CraftEntity - not Paper?"
         );
 
-        craftEntityGetHandle = sneakyThrows(() -> lookup.unreflect(craftEntityClass.getDeclaredMethod("getHandle")));
+        craftEntityGetHandle = sneakyThrows(() ->
+                lookup.unreflect(craftEntityClass.getDeclaredMethod("getHandle")));
 
         entityGetRandom = sneakyThrows(() -> lookup.unreflectGetter(randomField));
-        entitySetRandom = sneakyThrows(() -> lookup.unreflectSetter(randomField));
+
+        /*
+         * Paper 26.2 declares Entity.random as:
+         *
+         *     protected final RandomSource random = SHARED_RANDOM;
+         *
+         * A normal MethodHandle setter is therefore not usable on Java 25.
+         * Use Unsafe only for the final-field replacement that RandomControl
+         * specifically needs.
+         */
+        randomFieldWriter = ObjectUnsafe.create(randomField);
     }
 
     public static void updateRandom(final org.bukkit.entity.Entity entity, final @Nullable Long seed) {
@@ -93,9 +113,41 @@ public final class Compatibility {
                 randomSetSeed.invoke(random, seed);
             }
 
-            entitySetRandom.invoke(wrapped, random);
+            randomFieldWriter.set(wrapped, random);
         } catch (final Throwable t) {
-            throw new RuntimeException("Failed to update random on entity " + entity.getName() + " " + entity.getLocation() + " " + entity.getUniqueId(), t);
+            throw new RuntimeException(
+                    "Failed to update random on entity " + entity.getName() + " "
+                            + entity.getLocation() + " " + entity.getUniqueId(), t);
+        }
+    }
+
+    private static final class ObjectUnsafe {
+        private static final sun.misc.Unsafe UNSAFE = getUnsafe();
+        private final long offset;
+
+        private ObjectUnsafe(final long offset) {
+            this.offset = offset;
+        }
+
+        static ObjectUnsafe create(final Field field) {
+            if (UNSAFE == null) {
+                throw new ExceptionInInitializerError("sun.misc.Unsafe is unavailable; cannot replace Paper's final Entity.random field.");
+            }
+            return new ObjectUnsafe(UNSAFE.objectFieldOffset(field));
+        }
+
+        void set(final Object target, final Object value) {
+            UNSAFE.putObject(target, offset, value);
+        }
+
+        private static sun.misc.Unsafe getUnsafe() {
+            try {
+                final Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+                field.setAccessible(true);
+                return (sun.misc.Unsafe) field.get(null);
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                return null;
+            }
         }
     }
 }
